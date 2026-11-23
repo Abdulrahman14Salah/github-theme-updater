@@ -185,7 +185,84 @@ class GTU_Settings
                 submit_button();
                 ?>
             </form>
+            <?php $this->render_debug_panel(); ?>
         </div>
         <?php
+    }
+
+    /**
+     * Debug panel: runs the exact same GitHub request the updater uses and
+     * prints the raw result. Safe, read-only, no changes to any stored data.
+     * Kept permanently so future setups (new sites/themes) can self-diagnose
+     * "why isn't my update showing" without needing server/log access.
+     */
+    private function render_debug_panel()
+    {
+        $settings = get_option(GTU_OPTION_KEY, []);
+
+        $theme_slug  = $settings['theme_slug'] ?? '';
+        $github_user = $settings['github_user'] ?? '';
+        $github_repo = $settings['github_repo'] ?? '';
+        $visibility  = ($settings['visibility'] ?? 'public') === 'private' ? 'private' : 'public';
+        $token       = $settings['github_token'] ?? '';
+
+        echo '<hr/><h2>' . esc_html__('Debug', 'github-theme-updater') . '</h2>';
+        echo '<p class="description">' . esc_html__('Live diagnostic of the exact GitHub request this plugin makes — use this to see why an update is or isn\'t detected.', 'github-theme-updater') . '</p>';
+
+        if (empty($theme_slug) || empty($github_user) || empty($github_repo)) {
+            echo '<p style="color:red;">' . esc_html__('Essential settings are empty — the updater never runs. Fill theme slug, GitHub username and repository above and save.', 'github-theme-updater') . '</p>';
+            return;
+        }
+
+        $theme_data      = wp_get_theme($theme_slug);
+        $current_version = $theme_data->exists() ? $theme_data->get('Version') : null;
+
+        echo '<table class="widefat" style="max-width:900px;">';
+        printf('<tr><th>theme_data->exists()</th><td>%s</td></tr>', $theme_data->exists() ? 'true' : 'FALSE — wp_get_theme("' . esc_html($theme_slug) . '") found nothing. Check the Theme slug matches the installed folder name exactly.');
+        printf('<tr><th>Installed Version (from style.css)</th><td>%s</td></tr>', esc_html((string) $current_version));
+        printf('<tr><th>visibility</th><td>%s</td></tr>', esc_html($visibility));
+        printf('<tr><th>token present?</th><td>%s (length %d)</td></tr>', $token !== '' ? 'yes' : 'no', strlen($token));
+
+        $api_url = $visibility === 'private'
+            ? 'https://api.github.com/repos/' . $github_user . '/' . $github_repo . '/releases/latest'
+            : 'https://raw.githubusercontent.com/' . $github_user . '/' . $github_repo . '/main/update-manifest.json';
+
+        printf('<tr><th>API URL being called</th><td>%s</td></tr>', esc_html($api_url));
+
+        $transient_key = 'gtu_github_release_' . $theme_slug;
+        $cached        = get_transient($transient_key);
+        printf('<tr><th>Cached transient (%s)?</th><td>%s</td></tr>', esc_html($transient_key), $cached ? 'YES — cached tag: ' . esc_html($cached->tag_name ?? '?') : 'empty');
+
+        // Make the live request now, exactly like the updater would (bypassing cache for this debug view).
+        $headers = [
+            'Accept'     => 'application/vnd.github+json',
+            'User-Agent' => 'WordPress/' . get_bloginfo('version') . '; ' . home_url('/'),
+        ];
+        if ($visibility === 'private' && $token !== '') {
+            $headers['Authorization'] = 'Bearer ' . $token;
+        }
+
+        $response = wp_safe_remote_get(esc_url_raw($api_url), ['timeout' => 15, 'headers' => $headers]);
+
+        if (is_wp_error($response)) {
+            printf('<tr><th style="color:red;">Live request result</th><td style="color:red;">WP_Error: %s</td></tr>', esc_html($response->get_error_message()));
+        } else {
+            $code = wp_remote_retrieve_response_code($response);
+            $body = wp_remote_retrieve_body($response);
+            $decoded = json_decode($body);
+            $tag  = isset($decoded->tag_name) ? $decoded->tag_name : (isset($decoded->message) ? 'ERROR: ' . $decoded->message : '(unparseable)');
+
+            printf('<tr><th>Live HTTP status</th><td>%s</td></tr>', esc_html((string) $code));
+            printf('<tr><th>Live tag_name / message</th><td>%s</td></tr>', esc_html((string) $tag));
+            echo '<tr><th>Raw body (first 1500 chars)</th><td><textarea readonly style="width:100%;height:150px;">' . esc_textarea(substr($body, 0, 1500)) . '</textarea></td></tr>';
+
+            if (isset($decoded->tag_name) && $current_version !== null) {
+                $latest = ltrim((string) $decoded->tag_name, 'v');
+                $cmp    = version_compare($current_version, $latest, '<');
+                printf('<tr><th>version_compare(%s, %s, "&lt;")</th><td>%s</td></tr>', esc_html($current_version), esc_html($latest), $cmp ? 'TRUE (update should show)' : 'FALSE (no update — versions equal or installed is newer)');
+            }
+        }
+
+        echo '</table>';
     }
 }
